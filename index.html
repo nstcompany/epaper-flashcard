@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E-Paper Flashcard BLE Test</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f3f4f6;margin:0;padding:16px;color:#111}
+.wrap{max-width:720px;margin:auto}
+.card,.panel{background:#fff;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 2px 12px #0001}
+h1{font-size:24px;margin:0 0 6px}.muted{color:#666;font-size:14px}
+.word{font-size:48px;font-weight:800;text-align:center;margin:24px 0 4px}.pron{text-align:center;color:#555}
+.vn{text-align:center;font-size:22px;margin:10px}.ex{text-align:center;color:#555}
+button{border:0;border-radius:10px;padding:13px 16px;margin:4px;font-size:16px;background:#2563eb;color:#fff}
+button:disabled{opacity:.45} .row{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
+#status{padding:10px;border-radius:10px;background:#eef2ff;margin-bottom:12px}
+#log{height:180px;overflow:auto;background:#111;color:#ddd;padding:10px;border-radius:10px;font:12px monospace;white-space:pre-wrap}
+canvas{width:100%;max-width:500px;image-rendering:pixelated;border:1px solid #ddd;display:block;margin:12px auto}
+.progress{height:10px;background:#ddd;border-radius:99px;overflow:hidden}.bar{height:100%;width:0;background:#2563eb}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h1>E-Paper Flashcard</h1>
+    <div class="muted">nRF52 2.13" • protocol extracted from the original controller</div>
+  </div>
+
+  <div class="panel">
+    <div id="status">Chưa kết nối</div>
+    <div class="row">
+      <button id="connect">🔵 Kết nối E-Paper</button>
+      <button id="send" disabled>📤 Gửi từ hiện tại</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="word" class="word">APPLE</div>
+    <div id="pron" class="pron">/ˈæpəl/</div>
+    <div id="vn" class="vn">quả táo</div>
+    <div id="ex" class="ex">I eat an apple every day.</div>
+    <div class="row">
+      <button id="prev">← Trước</button>
+      <button id="next">Tiếp →</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div>Preview 250 × 128</div>
+    <canvas id="epd" width="250" height="128"></canvas>
+    <div class="progress"><div id="bar" class="bar"></div></div>
+  </div>
+
+  <div class="panel">
+    <div><b>Log</b></div>
+    <pre id="log"></pre>
+  </div>
+</div>
+
+<script>
+const SERVICE_UUID = '62750001-d828-918d-fb46-b6c11c675aec';
+const CHAR_UUID = '62750002-d828-918d-fb46-b6c11c675aec';
+const VERSION_UUID = '62750003-d828-918d-fb46-b6c11c675aec';
+
+const CMD_INIT = 0x01;
+const CMD_WRITE_IMAGE = 0x30;
+const CMD_REFRESH = 0x05;
+const CMD_ACTIVATE = 0xa0;
+
+const words = [
+  ["APPLE","/ˈæpəl/","quả táo","I eat an apple every day."],
+  ["BOOK","/bʊk/","quyển sách","I am reading a book."],
+  ["CHAIR","/tʃeə/","cái ghế","Please sit on the chair."],
+  ["DOG","/dɒɡ/","con chó","The dog is very friendly."],
+  ["EASY","/ˈiːzi/","dễ","This question is easy."],
+  ["FAMILY","/ˈfæməli/","gia đình","My family lives in Vietnam."],
+  ["GOOD","/ɡʊd/","tốt","This is a good idea."],
+  ["HOUSE","/haʊs/","ngôi nhà","My house is near the beach."],
+  ["IMPORTANT","/ɪmˈpɔːtənt/","quan trọng","English is important for my work."],
+  ["JOB","/dʒɒb/","công việc","I have a new job."]
+];
+
+let device=null, server=null, characteristic=null, imageChunkSize=128, index=0;
+
+const $=id=>document.getElementById(id);
+function log(s){$("log").textContent += s+"\\n"; $("log").scrollTop=$("log").scrollHeight}
+function delay(ms){return new Promise(r=>setTimeout(r,ms))}
+function hex(a){return [...a].map(x=>x.toString(16).padStart(2,"0")).join(" ")}
+
+function drawCard(){
+  const [w,p,v,e]=words[index];
+  $("word").textContent=w; $("pron").textContent=p; $("vn").textContent=v; $("ex").textContent=e;
+  const c=$("epd"),ctx=c.getContext("2d");
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,250,128);
+  ctx.fillStyle="#000";ctx.textAlign="center";
+  ctx.font="bold 30px Arial";ctx.fillText(w,125,48);
+  ctx.font="15px Arial";ctx.fillText(v,125,76);
+  ctx.font="12px Arial";ctx.fillText(p,125,98);
+  ctx.font="10px Arial";ctx.fillText("E-PAPER FLASHCARD",125,116);
+}
+drawCard();
+
+async function sendCommand(data){
+  if(!characteristic) throw new Error("Chưa kết nối BLE");
+  await characteristic.writeValueWithResponse(data);
+}
+
+function canvas2bytesBW(canvas){
+  const ctx=canvas.getContext("2d"), d=ctx.getImageData(0,0,canvas.width,canvas.height).data;
+  const out=[], buf=[];
+  for(let x=canvas.width-1;x>=0;x--){
+    for(let y=0;y<canvas.height;y++){
+      const i=(canvas.width*4*y)+x*4;
+      buf.push(d[i]>0 && d[i+1]>0 && d[i+2]>0 ? 1 : 0);
+      if(buf.length===8){out.push(parseInt(buf.join(""),2));buf.length=0}
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function makeRedPlane(canvas){
+  // The original firmware expects the red plane inverted:
+  // non-red pixels -> 0xff, red pixels -> 0x00.
+  return new Uint8Array(canvas2bytesBW(canvas).map(x=>x^0xff));
+}
+
+async function sendPlane(data, blackPlane){
+  const total=Math.ceil(data.length/imageChunkSize);
+  for(let off=0,part=0;off<data.length;off+=imageChunkSize,part++){
+    const chunk=data.slice(off,Math.min(off+imageChunkSize,data.length));
+    const begin=off===0?0x00:0xf0;
+    const plane=blackPlane?0x0f:0x00;
+    const packet=new Uint8Array(2+chunk.length);
+    packet[0]=CMD_WRITE_IMAGE;
+    packet[1]=begin|plane;
+    packet.set(chunk,2);
+    await sendCommand(packet);
+    $("bar").style.width=((part+1)/total*50+(blackPlane?0:50))+"%";
+    await delay(8);
+  }
+}
+
+async function sendCurrent(){
+  if(!characteristic)return;
+  $("send").disabled=true;
+  try{
+    $("status").textContent="Đang gửi APP...";
+    $("bar").style.width="0%";
+    drawCard();
+
+    await sendCommand(new Uint8Array([CMD_INIT]));
+    await delay(100);
+
+    const black=canvas2bytesBW($("epd"));
+    const red=makeRedPlane($("epd"));
+    log(`Sending ${words[index][0]}: black=${black.length} bytes, red=${red.length} bytes, chunk=${imageChunkSize}`);
+
+    await sendPlane(black,true);
+    await sendPlane(red,false);
+    await sendCommand(new Uint8Array([CMD_REFRESH]));
+    $("bar").style.width="100%";
+    $("status").textContent=`Đã gửi: ${words[index][0]}`;
+    log("Refresh sent ✓");
+  }catch(e){
+    $("status").textContent="Lỗi: "+e.message;
+    log("ERROR: "+e.message);
+  }finally{
+    $("send").disabled=false;
+  }
+}
+
+async function connect(){
+  try{
+    if(!navigator.bluetooth) throw new Error("Trình duyệt này không hỗ trợ Web Bluetooth.");
+    $("status").textContent="Đang quét...";
+    device=await navigator.bluetooth.requestDevice({
+      acceptAllDevices:true,
+      optionalServices:[SERVICE_UUID]
+    });
+    device.addEventListener("gattserverdisconnected",()=>{
+      characteristic=null;$("send").disabled=true;$("status").textContent="Đã ngắt kết nối";log("Disconnected");
+    });
+    server=await device.gatt.connect();
+    log("GATT server found");
+    const service=await server.getPrimaryService(SERVICE_UUID);
+    characteristic=await service.getCharacteristic(CHAR_UUID);
+    await characteristic.startNotifications();
+    characteristic.addEventListener("characteristicvaluechanged",event=>{
+      const a=new Uint8Array(event.target.value.buffer,event.target.value.byteOffset,event.target.value.byteLength);
+      const text=new TextDecoder().decode(a);
+      log("RX: "+(text.trim()||hex(a)));
+      if(text.startsWith("mtu=")){
+        const mtu=parseInt(text.substring(4),10);
+        if(Number.isFinite(mtu)) imageChunkSize=Math.max(18,Math.min(244,mtu-2));
+        log("Image chunk size = "+imageChunkSize);
+      }
+    });
+    try{
+      const v=await service.getCharacteristic(VERSION_UUID);
+      const val=await v.readValue();
+      log("Firmware version: "+val.getUint8(0));
+    }catch(e){log("Firmware version not readable")}
+    await sendCommand(new Uint8Array([CMD_ACTIVATE]));
+    await delay(120);
+    await sendCommand(new Uint8Array([CMD_INIT]));
+    await delay(100);
+    $("status").textContent="Đã kết nối nRF52 ✓";
+    $("send").disabled=false;
+    log("nRF52 connected; display initialized ✓");
+  }catch(e){
+    $("status").textContent="Lỗi kết nối: "+e.message;
+    log("CONNECT ERROR: "+e.message);
+  }
+}
+
+$("connect").onclick=connect;
+$("send").onclick=sendCurrent;
+$("next").onclick=()=>{index=(index+1)%words.length;drawCard();if(characteristic)sendCurrent()};
+$("prev").onclick=()=>{index=(index-1+words.length)%words.length;drawCard();if(characteristic)sendCurrent()};
+</script>
+</body>
+</html>
