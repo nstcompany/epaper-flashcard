@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E-Paper Flashcard v2</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:#111827}
+.wrap{max-width:720px;margin:auto;padding:16px}.panel,.card{background:#fff;border-radius:18px;padding:18px;margin-bottom:14px;box-shadow:0 2px 12px #00000012}
+h1{margin:0 0 4px;font-size:26px}.muted{color:#6b7280}.status{margin-top:12px;padding:10px;border-radius:10px;background:#eef2ff}
+.word{font-size:48px;font-weight:800;text-align:center;margin:18px 0 5px}.pron{text-align:center;font-size:22px;color:#4b5563}.vn{text-align:center;font-size:24px;font-weight:700;margin:12px}.ex{text-align:center;color:#6b7280;font-style:italic}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}button{border:0;border-radius:12px;padding:13px 14px;font-size:16px;font-weight:700;background:#2563eb;color:white}button:disabled{opacity:.45}
+canvas{display:block;width:100%;max-width:500px;height:auto;border:1px solid #ddd;margin:10px auto;background:#fff;image-rendering:pixelated}
+#log{height:180px;overflow:auto;background:#111827;color:#d1d5db;padding:10px;border-radius:10px;font:12px monospace;white-space:pre-wrap}
+.progress{height:10px;background:#e5e7eb;border-radius:99px;overflow:hidden}.bar{height:100%;width:0;background:#2563eb}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h1>E-Paper Flashcard</h1>
+    <div class="muted">nRF52 • 2.13" • BLE</div>
+    <div id="status" class="status">Chưa kết nối</div>
+    <div class="row" style="margin-top:10px">
+      <button id="connect">🔵 Kết nối E-Paper</button>
+      <button id="send" disabled>📤 Gửi APPLE</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="counter" style="text-align:center;color:#6b7280">1 / 10</div>
+    <div id="word" class="word">APPLE</div>
+    <div id="pron" class="pron">/ˈæpəl/</div>
+    <div id="vn" class="vn">quả táo</div>
+    <div id="ex" class="ex">I eat an apple every day.</div>
+    <div class="row" style="margin-top:14px">
+      <button id="prev">← Trước</button>
+      <button id="next">Tiếp →</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <b>Preview đúng kích thước nRF52 2.13": 250 × 128</b>
+    <canvas id="epd" width="250" height="128"></canvas>
+    <div class="progress"><div id="bar" class="bar"></div></div>
+  </div>
+
+  <div class="panel"><b>Log</b><pre id="log"></pre></div>
+</div>
+
+<script>
+const SERVICE_UUID='62750001-d828-918d-fb46-b6c11c675aec';
+const CHAR_UUID='62750002-d828-918d-fb46-b6c11c675aec';
+const APP_VERSION_UUID='62750003-d828-918d-fb46-b6c11c675aec';
+
+const CMD_WRITE_IMAGE=0x30;
+const CMD_REFRESH=0x05;
+const CMD_INIT=0x01;
+
+const words=[
+["APPLE","/ˈæpəl/","quả táo","I eat an apple every day."],
+["BOOK","/bʊk/","quyển sách","I am reading a book."],
+["CHAIR","/tʃeə/","cái ghế","Please sit on the chair."],
+["DOG","/dɒɡ/","con chó","The dog is very friendly."],
+["EASY","/ˈiːzi/","dễ","This question is easy."],
+["FAMILY","/ˈfæməli/","gia đình","My family lives in Vietnam."],
+["GOOD","/ɡʊd/","tốt","This is a good idea."],
+["HOUSE","/haʊs/","ngôi nhà","My house is near the beach."],
+["IMPORTANT","/ɪmˈpɔːtənt/","quan trọng","English is important for my work."],
+["JOB","/dʒɒb/","công việc","I have a new job."]
+];
+
+let device=null,server=null,characteristic=null,index=0;
+let imageChunkSize=128;
+
+const $=id=>document.getElementById(id);
+const delay=ms=>new Promise(r=>setTimeout(r,ms));
+function log(s){$("log").textContent+=s+"\\n";$("log").scrollTop=$("log").scrollHeight}
+
+function drawCard(){
+ const [w,p,v,e]=words[index];
+ $("counter").textContent=`${index+1} / ${words.length}`;
+ $("word").textContent=w;$("pron").textContent=p;$("vn").textContent=v;$("ex").textContent=e;
+ $("send").textContent=`📤 Gửi ${w}`;
+ const c=$("epd"),ctx=c.getContext("2d");
+ ctx.fillStyle="white";ctx.fillRect(0,0,250,128);
+ ctx.fillStyle="black";ctx.textAlign="center";
+ ctx.font="bold 28px Arial";ctx.fillText(w,125,40);
+ ctx.font="15px Arial";ctx.fillText(v,125,68);
+ ctx.font="13px Arial";ctx.fillText(p,125,91);
+ ctx.font="11px Arial";ctx.fillText("E-PAPER FLASHCARD",125,114);
+}
+drawCard();
+
+/* EXACT converter used by the original nRF52 website for 2.13/2.9:
+   bytes are column-first, x descending, y ascending. */
+function canvas2bytes_bw(canvas,type='bw'){
+ const ctx=canvas.getContext("2d");
+ const imageData=ctx.getImageData(0,0,canvas.width,canvas.height);
+ const arr=[];let buffer=[];
+ for(let x=canvas.width-1;x>=0;x--){
+   for(let y=0;y<canvas.height;y++){
+     const i=(canvas.width*4*y)+x*4;
+     if(type!=='bwr'){
+       buffer.push(imageData.data[i]>0&&imageData.data[i+1]>0&&imageData.data[i+2]>0?1:0);
+     }else{
+       buffer.push(imageData.data[i]>0&&imageData.data[i+1]===0&&imageData.data[i+2]===0?1:0);
+     }
+     if(buffer.length===8){arr.push(parseInt(buffer.join(''),2));buffer=[]}
+   }
+ }
+ return arr;
+}
+
+async function sendCommand(cmd){
+ if(!characteristic)throw new Error("Chưa kết nối E-Paper");
+ await characteristic.writeValueWithResponse(cmd);
+}
+
+async function sendPlane(data,blackPlane,start,end){
+ const total=Math.ceil(data.length/imageChunkSize);
+ for(let offset=0,part=0;offset<data.length;offset+=imageChunkSize,part++){
+   const chunk=data.slice(offset,Math.min(offset+imageChunkSize,data.length));
+   const begin=offset===0?0x00:0xf0;
+   const plane=blackPlane?0x0f:0x00;
+   const packet=new Uint8Array([CMD_WRITE_IMAGE,begin|plane,...chunk]);
+   await sendCommand(packet);
+   const pct=start+((part+1)/total)*(end-start);
+   $("bar").style.width=pct+"%";
+   await delay(8);
+ }
+}
+
+async function sendCurrent(){
+ if(!characteristic)return;
+ $("send").disabled=true;
+ try{
+   $("status").textContent="Đang gửi ảnh...";
+   $("bar").style.width="0%";
+
+   // Exact original uploader sequence.
+   await sendCommand(new Uint8Array([CMD_INIT]));
+   await delay(100);
+
+   const black=canvas2bytes_bw($("epd"));
+   // IMPORTANT: red plane must be generated from BWR pixels, not from the BW plane.
+   // There are no red pixels in this flashcard, so this becomes all 0xff.
+   const red=canvas2bytes_bw($("epd"),"bwr").map(byte=>byte^0xff);
+
+   log(`2.13 image: black=${black.length} bytes, red=${red.length} bytes, chunk=${imageChunkSize}`);
+   await sendPlane(black,true,0,48);
+   await sendPlane(red,false,48,95);
+
+   $("bar").style.width="97%";
+   await sendCommand(new Uint8Array([CMD_REFRESH]));
+   $("bar").style.width="100%";
+   $("status").textContent=`Đã gửi ${words[index][0]} ✓`;
+   log("Refresh sent ✓");
+ }catch(e){
+   $("status").textContent="Lỗi: "+e.message;
+   log("ERROR: "+e.message);
+ }finally{$("send").disabled=false}
+}
+
+async function connect(){
+ try{
+   if(!navigator.bluetooth)throw new Error("Web Bluetooth không được hỗ trợ.");
+   $("status").textContent="Đang quét...";
+   device=await navigator.bluetooth.requestDevice({
+     acceptAllDevices:true,
+     optionalServices:[SERVICE_UUID]
+   });
+   device.addEventListener("gattserverdisconnected",()=>{
+     characteristic=null;$("send").disabled=true;$("status").textContent="Đã ngắt kết nối";
+     log("Disconnected");
+   });
+   server=await device.gatt.connect();
+   log("GATT server found");
+
+   const service=await server.getPrimaryService(SERVICE_UUID);
+   characteristic=await service.getCharacteristic(CHAR_UUID);
+
+   try{
+     const av=await service.getCharacteristic(APP_VERSION_UUID);
+     const val=await av.readValue();
+     log("nRF52 firmware version: "+val.getUint8(0));
+   }catch(e){log("Firmware version: không đọc được")}
+
+   characteristic.addEventListener("characteristicvaluechanged",e=>{
+     const a=new Uint8Array(e.target.value.buffer,e.target.value.byteOffset,e.target.value.byteLength);
+     const msg=new TextDecoder().decode(a);
+     if(msg.startsWith("mtu=")){
+       const mtu=parseInt(msg.substring(4),10);
+       if(Number.isFinite(mtu)&&mtu>2)imageChunkSize=Math.max(18,Math.min(244,mtu-2));
+       log(`nRF52 ${msg}, image chunk: ${imageChunkSize} bytes`);
+     }else{
+       log("RX: "+(msg.trim()||Array.from(a).map(x=>x.toString(16).padStart(2,"0")).join(" ")));
+     }
+   });
+   await characteristic.startNotifications();
+
+   // The original site sends INIT after enabling notifications.
+   await sendCommand(new Uint8Array([CMD_INIT]));
+   await delay(100);
+
+   $("status").textContent="Đã kết nối nRF52 ✓";
+   $("send").disabled=false;
+   log("nRF52 connected; display initialized.");
+ }catch(e){
+   $("status").textContent="Lỗi kết nối: "+e.message;
+   log("CONNECT ERROR: "+e.message);
+ }
+}
+
+$("connect").onclick=connect;
+$("send").onclick=sendCurrent;
+$("next").onclick=async()=>{index=(index+1)%words.length;drawCard();if(characteristic)await sendCurrent()};
+$("prev").onclick=async()=>{index=(index-1+words.length)%words.length;drawCard();if(characteristic)await sendCurrent()};
+</script>
+</body>
+</html>
